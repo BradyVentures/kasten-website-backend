@@ -167,18 +167,50 @@ async function processGeneration(
       if (height) config.hoehe = height;
       if (depth) config.tiefe = depth;
 
-      // Preis über CRM kalkulieren
+      // Preis über CRM kalkulieren — alle Attribute + Maße senden
       let unitPrice = 0;
       try {
         const calcParams = new URLSearchParams();
         if (width) calcParams.set('breite', String(width));
         if (height) calcParams.set('hoehe', String(height));
         if (depth) calcParams.set('tiefe', String(depth));
+
+        // Attribute-Labels zu Values umwandeln via CRM Kategorien-API
+        const catRes = await fetch(`${CRM_API_URL}/products/visualizer/categories`);
+        if (catRes.ok) {
+          const cats = await catRes.json() as Array<{
+            slug: string;
+            attributes: Array<{
+              slug: string;
+              attribute_type: string;
+              options: Array<{ value: string; label: string }>;
+            }>;
+          }>;
+          const cat = cats.find(c => c.slug === categorySlug);
+          if (cat) {
+            for (const attr of cat.attributes) {
+              const userValue = preferences[attr.slug];
+              if (!userValue) continue;
+
+              if (attr.attribute_type === 'select') {
+                // User hat Label gewählt (z.B. "Aluminium"), wir brauchen Value (z.B. "aluminium")
+                const opt = attr.options.find(o => o.label === userValue || o.value === userValue);
+                if (opt) calcParams.set(attr.slug, opt.value);
+              } else if (attr.attribute_type === 'boolean') {
+                calcParams.set(attr.slug, userValue);
+              }
+            }
+          }
+        }
+
+        console.log('Calculate URL:', `${CRM_API_URL}/products/categories/${categorySlug}/calculate?${calcParams}`);
         const calcRes = await fetch(`${CRM_API_URL}/products/categories/${categorySlug}/calculate?${calcParams}`);
         if (calcRes.ok) {
-          const calcData = await calcRes.json() as { unitPrice?: number };
+          const calcData = await calcRes.json() as { unitPrice?: number; productName?: string };
           unitPrice = calcData.unitPrice || 0;
           console.log('Calculated price:', unitPrice, 'EUR');
+        } else {
+          console.error('Calculate response:', calcRes.status, await calcRes.text());
         }
       } catch (err) {
         console.error('Price calculation failed:', err);
