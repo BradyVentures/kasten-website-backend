@@ -47,14 +47,23 @@ export async function generateVisualization(
 
   console.log('OpenAI prompt:', prompt);
 
-  // Resize image — keep aspect ratio, max 1536px for quality
-  const rgbaBuffer = await sharp(originalImagePath)
+  // Auto-rotate based on EXIF, resize keeping aspect ratio
+  const image = sharp(originalImagePath).rotate(); // .rotate() without args = auto EXIF
+  const metadata = await image.metadata();
+  const width = metadata.width || 1024;
+  const height = metadata.height || 1024;
+  const isLandscape = width >= height;
+
+  console.log(`Original image: ${width}x${height} (${isLandscape ? 'landscape' : 'portrait'})`);
+
+  const rgbaBuffer = await image
     .resize(1536, 1536, { fit: 'inside', withoutEnlargement: true })
     .ensureAlpha()
     .png()
     .toBuffer();
 
-  const imageFile = await toFile(rgbaBuffer, 'image.png', { type: 'image/png' });
+  // Choose output size matching aspect ratio
+  const outputSize = isLandscape ? '1536x1024' : '1024x1536';
 
   let resultBuffer: Buffer;
 
@@ -63,14 +72,14 @@ export async function generateVisualization(
 
   for (const model of models) {
     try {
-      console.log(`Trying ${model} images.edit...`);
+      console.log(`Trying ${model} images.edit (output: ${model === 'dall-e-2' ? '1024x1024' : outputSize})...`);
       const currentImageFile = await toFile(rgbaBuffer, 'image.png', { type: 'image/png' });
 
       const response = await openai.images.edit({
         model,
         image: currentImageFile,
         prompt: model === 'dall-e-2' ? prompt.slice(0, 1000) : prompt,
-        size: '1024x1024',
+        size: model === 'dall-e-2' ? '1024x1024' : (outputSize as '1024x1024'),
       });
 
       const data = response.data?.[0];
