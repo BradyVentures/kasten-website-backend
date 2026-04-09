@@ -1,4 +1,4 @@
-import OpenAI, { toFile } from 'openai';
+import OpenAI from 'openai';
 import sharp from 'sharp';
 import fs from 'fs';
 import path from 'path';
@@ -44,11 +44,10 @@ export async function generateVisualization(
   preferences: Record<string, string>
 ): Promise<string> {
   const prompt = buildPrompt(categorySlug, categoryName, preferences);
-
   console.log('OpenAI prompt:', prompt);
 
-  // Auto-rotate based on EXIF, resize keeping aspect ratio
-  const image = sharp(originalImagePath).rotate(); // .rotate() without args = auto EXIF
+  // Auto-rotate EXIF, resize keeping aspect ratio
+  const image = sharp(originalImagePath).rotate();
   const metadata = await image.metadata();
   const width = metadata.width || 1024;
   const height = metadata.height || 1024;
@@ -56,30 +55,50 @@ export async function generateVisualization(
 
   console.log(`Original image: ${width}x${height} (${isLandscape ? 'landscape' : 'portrait'})`);
 
-  const rgbaBuffer = await image
+  // Save as temp PNG for the API
+  const tempPath = path.join(__dirname, '..', '..', 'uploads', `temp_${uuidv4()}.png`);
+  await image
     .resize(1536, 1536, { fit: 'inside', withoutEnlargement: true })
-    .ensureAlpha()
     .png()
-    .toBuffer();
+    .toFile(tempPath);
 
-  // Choose output size matching aspect ratio
   const outputSize = isLandscape ? '1536x1024' : '1024x1536';
 
   let resultBuffer: Buffer;
 
-  // Try gpt-image-1.5 first (best at preserving originals), then gpt-image-1, then dall-e-2
-  const models = ['gpt-image-1.5', 'gpt-image-1', 'dall-e-2'];
+  try {
+    // Use gpt-image-1.5 with input_fidelity: high for best original preservation
+    console.log('Using gpt-image-1.5 with input_fidelity: high...');
+    const response = await openai.images.edit({
+      model: 'gpt-image-1.5',
+      image: [fs.createReadStream(tempPath)] as unknown as Parameters<typeof openai.images.edit>[0]['image'],
+      prompt,
+      input_fidelity: 'high' as unknown as undefined,
+      size: outputSize as '1024x1024',
+    });
 
-  for (const model of models) {
+    const data = response.data?.[0];
+    if (data?.b64_json) {
+      resultBuffer = Buffer.from(data.b64_json, 'base64');
+    } else if (data?.url) {
+      const imgRes = await fetch(data.url);
+      resultBuffer = Buffer.from(await imgRes.arrayBuffer());
+    } else {
+      throw new Error('No image data in response');
+    }
+    console.log('gpt-image-1.5 edit successful');
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error('gpt-image-1.5 failed:', errMsg);
+
+    // Fallback to gpt-image-1
     try {
-      console.log(`Trying ${model} images.edit (output: ${model === 'dall-e-2' ? '1024x1024' : outputSize})...`);
-      const currentImageFile = await toFile(rgbaBuffer, 'image.png', { type: 'image/png' });
-
+      console.log('Falling back to gpt-image-1...');
       const response = await openai.images.edit({
-        model,
-        image: currentImageFile,
-        prompt: model === 'dall-e-2' ? prompt.slice(0, 1000) : prompt,
-        size: model === 'dall-e-2' ? '1024x1024' : (outputSize as '1024x1024'),
+        model: 'gpt-image-1',
+        image: [fs.createReadStream(tempPath)] as unknown as Parameters<typeof openai.images.edit>[0]['image'],
+        prompt,
+        size: outputSize as '1024x1024',
       });
 
       const data = response.data?.[0];
@@ -89,28 +108,20 @@ export async function generateVisualization(
         const imgRes = await fetch(data.url);
         resultBuffer = Buffer.from(await imgRes.arrayBuffer());
       } else {
-        throw new Error(`No image data in ${model} response`);
+        throw new Error('No image data in gpt-image-1 response');
       }
-
-      console.log(`${model} edit successful`);
-
-      const resultFilename = `${uuidv4()}.png`;
-      const resultPath = path.join(__dirname, '..', '..', 'uploads', 'results', resultFilename);
-      fs.writeFileSync(resultPath, resultBuffer!);
-      return resultFilename;
-
-    } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(`${model} failed:`, errMsg);
-
-      // If it's a model-not-found error, try next model
-      if (errMsg.includes('model') || errMsg.includes('not found') || errMsg.includes('does not exist') || errMsg.includes('invalid')) {
-        continue;
-      }
-      // For other errors (auth, rate limit, etc.), throw immediately
-      throw err;
+      console.log('gpt-image-1 edit successful');
+    } catch (err2: unknown) {
+      console.error('gpt-image-1 also failed:', err2 instanceof Error ? err2.message : String(err2));
+      throw err2;
     }
+  } finally {
+    // Cleanup temp file
+    try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
   }
 
-  throw new Error('All image generation models failed');
+  const resultFilename = `${uuidv4()}.png`;
+  const resultPath = path.join(__dirname, '..', '..', 'uploads', 'results', resultFilename);
+  fs.writeFileSync(resultPath, resultBuffer!);
+  return resultFilename;
 }
