@@ -9,20 +9,18 @@ dotenv.config();
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Generischen Prompt aus Kategorie + dynamischen Attributen zusammenbauen
 function buildPrompt(categorySlug: string, categoryName: string, preferences: Record<string, string>): string {
-  // Attribut-Beschreibungen zusammensetzen (z.B. "RAL 7016 Anthrazitgrau, Funk-Antrieb")
   const attrParts = Object.entries(preferences)
     .filter(([key]) => key !== 'additional')
     .map(([, value]) => value)
     .join(', ');
 
-  const additionalWishes = preferences.additional ? ` Additional requirements: ${preferences.additional}.` : '';
+  const additionalWishes = preferences.additional ? ` Zusätzliche Anforderungen: ${preferences.additional}.` : '';
 
-  const baseInstructions = 'Keep the house structure, surroundings, lighting, and perspective exactly the same. Photorealistic result. High quality.';
+  const baseInstructions = 'IMPORTANT: Edit the provided photo. Keep the exact same house, same angle, same lighting, same surroundings, same perspective. Only add/change the specified building elements. The result must look like a real photo of the same house, not a different house. Photorealistic result.';
 
   if (categorySlug.includes('rollladen') || categorySlug.includes('rolllaeden')) {
-    return `Add ${attrParts} roller shutters (Rollläden) to all visible windows on this house. The roller shutters should look professionally installed, matching the architecture.${additionalWishes} ${baseInstructions}`;
+    return `Edit this photo: Add ${attrParts} roller shutters (Rollläden) to all visible windows on this house. The roller shutters should be professionally installed above each window, partially or fully closed, matching the house architecture and color scheme.${additionalWishes} ${baseInstructions}`;
   }
 
   if (categorySlug.includes('terrassendach') || categorySlug.includes('terrassendaecher')) {
@@ -31,17 +29,16 @@ function buildPrompt(categorySlug: string, categoryName: string, preferences: Re
     const needsMiddlePost = width > 4000;
     const depthInfo = depth > 0 ? ` The roof extends approximately ${(depth / 1000).toFixed(1)} meters from the house wall.` : '';
     const postInfo = needsMiddlePost
-      ? ' The roof span exceeds 4 meters, so it must have a center support post (Mittelstütze) in addition to the two front posts.'
-      : ' The roof has two front support posts, one on each side.';
-    return `Add a heroal CR aluminum terrace roof system (Terrassendach) to the terrace/patio area of this house. The system has slim, modern aluminum profiles in ${attrParts}, with glass roof panels.${postInfo}${depthInfo} It is a premium German-engineered patio cover with clean lines, integrated drainage, and minimal visible hardware. The roof connects flush to the house wall.${additionalWishes} ${baseInstructions}`;
+      ? ' Include a center support post (Mittelstütze) since the span exceeds 4 meters.'
+      : '';
+    return `Edit this photo: Add a modern aluminum terrace roof (Terrassendach) to the terrace/patio area. The system uses slim aluminum profiles in ${attrParts} with glass roof panels. It connects flush to the house wall with clean lines and minimal hardware.${postInfo}${depthInfo}${additionalWishes} ${baseInstructions}`;
   }
 
   if (categorySlug.includes('fenster') || categorySlug.includes('tuer') || categorySlug.includes('door') || categorySlug.includes('window')) {
-    return `Replace the existing windows and/or front door on this house with new ${attrParts} windows and door. The new elements should look professionally installed with modern hardware.${additionalWishes} ${baseInstructions}`;
+    return `Edit this photo: Replace the existing windows and/or front door with new ${attrParts} windows/doors. The new elements should look professionally installed with modern hardware and clean frames.${additionalWishes} ${baseInstructions}`;
   }
 
-  // Fallback: generischer Prompt
-  return `Add ${categoryName} (${attrParts}) to this house. The product should look professionally installed, matching the architecture.${additionalWishes} ${baseInstructions}`;
+  return `Edit this photo: Add ${categoryName} (${attrParts}) to this house. The product should look professionally installed, matching the existing architecture.${additionalWishes} ${baseInstructions}`;
 }
 
 export async function generateVisualization(
@@ -54,7 +51,7 @@ export async function generateVisualization(
 
   console.log('OpenAI prompt:', prompt);
 
-  // Bild zu RGBA PNG konvertieren (dall-e-2 erfordert RGBA)
+  // Resize to 1024x1024 PNG with alpha channel
   const rgbaBuffer = await sharp(originalImagePath)
     .resize(1024, 1024, { fit: 'cover' })
     .ensureAlpha()
@@ -63,16 +60,18 @@ export async function generateVisualization(
 
   const imageFile = await toFile(rgbaBuffer, 'image.png', { type: 'image/png' });
 
-  // Versuche gpt-image-1, Fallback auf dall-e-2
   let resultBuffer: Buffer;
 
   try {
+    // gpt-image-1 with images.edit — edits the provided image based on prompt
+    console.log('Using gpt-image-1 images.edit...');
     const response = await openai.images.edit({
       model: 'gpt-image-1',
       image: imageFile,
       prompt,
       size: '1024x1024',
     });
+
     const data = response.data?.[0];
     if (data?.b64_json) {
       resultBuffer = Buffer.from(data.b64_json, 'base64');
@@ -80,19 +79,24 @@ export async function generateVisualization(
       const imgRes = await fetch(data.url);
       resultBuffer = Buffer.from(await imgRes.arrayBuffer());
     } else {
-      throw new Error('No image in response');
+      throw new Error('No image data in gpt-image-1 response');
     }
+    console.log('gpt-image-1 edit successful');
   } catch (err: unknown) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    if (errMsg.includes('gpt-image-1') || errMsg.includes('invalid')) {
-      console.log('gpt-image-1 not available, falling back to dall-e-2');
+    console.error('gpt-image-1 failed:', errMsg);
+
+    // Fallback: Use dall-e-2 with edit
+    if (errMsg.includes('model') || errMsg.includes('invalid') || errMsg.includes('not found') || errMsg.includes('does not exist')) {
+      console.log('Falling back to dall-e-2...');
       const imageFile2 = await toFile(rgbaBuffer, 'image.png', { type: 'image/png' });
       const response = await openai.images.edit({
         model: 'dall-e-2',
         image: imageFile2,
-        prompt: prompt.slice(0, 1000), // dall-e-2 hat kürzeres Prompt-Limit
+        prompt: prompt.slice(0, 1000),
         size: '1024x1024',
       });
+
       const data = response.data?.[0];
       if (data?.url) {
         const imgRes = await fetch(data.url);
@@ -100,15 +104,16 @@ export async function generateVisualization(
       } else if (data?.b64_json) {
         resultBuffer = Buffer.from(data.b64_json, 'base64');
       } else {
-        throw new Error('No image in dall-e-2 response');
+        throw new Error('No image data in dall-e-2 response');
       }
+      console.log('dall-e-2 edit successful');
     } else {
       throw err;
     }
   }
+
   const resultFilename = `${uuidv4()}.png`;
   const resultPath = path.join(__dirname, '..', '..', 'uploads', 'results', resultFilename);
-
   fs.writeFileSync(resultPath, resultBuffer);
 
   return resultFilename;
